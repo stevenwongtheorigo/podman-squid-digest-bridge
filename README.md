@@ -9,11 +9,11 @@ configuration.
 ```mermaid
 flowchart TD
     agent["Coding agent / Codex tools"]
-    bridge["Local Podman bridge<br/>127.0.0.1:8080"]
+    bridge["Local container bridge<br/>127.0.0.1:8080"]
     corporate["Corporate Squid proxy"]
     destination["HTTPS service"]
     user["User enters credentials<br/>at startup.sh prompt"]
-    secret["Podman secret<br/>Protected credential file"]
+    secret["Protected credential storage<br/>Podman secret / Docker volume"]
 
     agent -->|"HTTPS CONNECT; no corporate credentials"| bridge
     corporate -->|"Digest challenge"| bridge
@@ -23,26 +23,47 @@ flowchart TD
     secret -.->|"Read once into memory"| bridge
 ```
 
-Passwords are not saved in `.env`, passed as Podman command arguments, or
-injected into the container environment. **Credentials are stored in a Podman
-secret and retained in bridge memory**; the secret survives shutdown and is
-not encrypted by default. Digest authentication sends a computed response
-instead of the plaintext password to the corporate proxy.
+Passwords are not saved in `.env`, passed as runtime command arguments, or
+injected into the container environment. **Credentials are retained in bridge
+memory and persistent runtime storage**: a Podman secret or a Docker volume.
+These stores survive shutdown and have no application-level encryption. Digest
+authentication sends a computed response instead of the plaintext password to
+the corporate proxy.
 
 Configure the agent's proxy-aware tools to use `http://127.0.0.1:8080` from the
 host running the bridge. These tools must support an HTTP proxy for HTTPS
 CONNECT requests. The bridge currently supports HTTPS tunnels only; ordinary
 HTTP requests return `501 Not Implemented`.
 
-Install [Podman](https://podman.io/docs/installation) before starting. If Podman
-is missing from `PATH`, `startup.sh` detects your operating system (macOS,
-Windows, or Linux) and prints the relevant installation instructions before
-exiting, without requesting configuration or credentials. WSL uses the Linux
-instructions.
+Install and start one of these Linux container runtimes:
+
+| Runtime | Installation | `CONTAINER_RUNTIME` |
+| --- | --- | --- |
+| Podman | [Setup guide](https://podman.io/docs/installation); on macOS/Windows, initialize and start a Podman machine | `podman` |
+| Docker Engine / Docker Desktop | [Setup guide](https://docs.docker.com/get-started/get-docker/) | `docker` |
+| OrbStack (macOS) | [Setup guide](https://docs.orbstack.dev/quick-start) | `orbstack` |
+
+The scripts require Bash, including on Windows (for example, Git Bash). WSL uses
+the Linux runtime behavior. Windows containers are not supported.
+
+`CONTAINER_RUNTIME=auto` is the default. On the first startup it prefers OrbStack
+when the Docker CLI and its `orbstack` context exist, then Docker, then Podman.
+Docker uses its current context,
+including `DOCKER_CONTEXT` or `DOCKER_HOST` overrides. OrbStack explicitly uses
+`docker --context orbstack`; it never changes your global Docker context.
+An installed engine that cannot connect causes an error, with no automatic
+fallback. Missing CLIs produce installation help before any credential prompt.
 
 Copy `.env.sample` to `.env` and set `UPSTREAM_SQUID_HOST` and
 `UPSTREAM_SQUID_PORT` to your upstream proxy endpoint. Use plain, unquoted
 `KEY=value` entries. The `.env` file is ignored by Git.
+
+Optionally set `CONTAINER_RUNTIME` in `.env`, or override it for one invocation:
+
+```sh
+CONTAINER_RUNTIME=orbstack ./startup.sh
+# Or: CONTAINER_RUNTIME=docker ./startup.sh
+```
 
 Run `./startup.sh`. The script prompts for your username and password, with
 password input hidden:
@@ -63,34 +84,85 @@ Stop the bridge with:
 ./shutdown.sh
 ```
 
-This stops the container and preserves its credential secret. Run `./startup.sh`
+This stops the container and preserves its credentials. Run `./startup.sh`
 to start again with fresh credentials.
 
-`startup.sh` reads the two upstream settings from `.env` beside the script.
-Exported variables override `.env` values. Both settings are required; there
-are no built-in defaults. Other `.env` entries, including credentials, are ignored.
+`startup.sh` reads `UPSTREAM_SQUID_HOST`, `UPSTREAM_SQUID_PORT`, and
+`CONTAINER_RUNTIME` from `.env` beside the script. Exported variables override
+`.env` values. Both upstream settings are required; there are no built-in
+defaults. Values are literal, unquoted text; other entries, including
+credentials, are ignored. `runtime.sh` shares configuration and connection
+handling between the startup and shutdown scripts.
 
-`startup.sh` uses Podman directly, replacing the previous Compose configuration.
+A successful startup saves its runtime and connection settings in the ignored
+`.bridge-runtime` file, with owner-only permissions and no proxy credentials.
+Automatic startup reuses that target, and shutdown always uses it, even if you
+change Docker's global context or export a different runtime. Named contexts
+and Podman connections must still exist and refer to the same engine.
+On Linux, Podman uses local storage unless `CONTAINER_CONNECTION` or
+`CONTAINER_HOST` selects a remote service. macOS/Windows use the default Podman
+connection. Docker host overrides also retain their TLS settings and certificate
+path for shutdown; certificate contents are never copied into the state file.
 
-The script removes credential environment variables before invoking Podman and
-sends the username and password through standard input to a native Podman
-secret named `squid-digest-bridge-credentials`. It then recreates the container
-with that secret mounted at `/run/secrets/proxy_digest_credentials` with mode
-`0400`. Credentials are never passed as container environment variables or
-command arguments. Podman's default secret driver stores a protected file in
-its own storage; it is not encrypted by default.
+To switch engines or connections, run `./shutdown.sh` first, then start with the
+new selection. Successful shutdown removes the runtime state file. Each engine
+keeps its own stopped container and credentials; switching does not transfer or
+delete those credentials. The published proxy is intended for tools on the
+same host, so use a local engine or local VM with working port forwarding and
+repository file sharing. Arbitrary remote hosts are not a supported deployment.
 
-The bridge reads the secret file once at startup, before listening, and unsets
-the two upstream configuration variables. Missing or invalid credentials cause
-startup to fail. `env`, `/proc/1/environ`, and `podman inspect`'s container
-environment do not contain the proxy credentials. New `podman exec` processes do
-not inherit them either.
+The scripts use the runtime CLI directly. Podman retains native `--replace`
+behavior. Docker replaces only containers labeled as managed by this project.
+Startup prepares the image and credential storage before replacing the current
+container. Replacement briefly interrupts connections. If the final container
+launch fails after replacement, rerun startup; it does not restore the old
+container. Failed Docker launches clean up the new container and volume where
+possible. Preparation failures leave the existing container and credentials
+intact.
 
-Credentials remain in Python memory for subsequent Digest challenges and in the
-secret file so the container can restart automatically. Container root or a
-process with access to the bridge's memory can still read them. Run `./startup.sh`
-again to apply new credentials; ordinary restarts reuse the existing secret
-file. If credentials were exported in your calling shell, unset them there
-after startup when no longer needed.
+For Podman, credentials pass through stdin to the native secret named
+`squid-digest-bridge-credentials`. The secret is mounted at
+`/run/secrets/proxy_digest_credentials` with mode `0400`. Podman's default secret
+driver stores a protected file; it is not encrypted by default.
+
+For Docker and OrbStack, a temporary container receives credentials through
+stdin and writes a mode-`0400` file into a fresh named volume. It uses the same
+Python image as the bridge, with networking disabled, and is removed afterward.
+The bridge mounts the volume read-only at `/run/secrets`. Each successful
+replacement removes the previous container's credential volume; shutdown keeps
+the current one for automatic restarts. Docker volumes are persistent storage,
+not Docker Swarm secrets, and have no application-level encryption.
+
+The bridge reads credentials once at startup, before listening, and unsets the
+two upstream configuration variables. Missing or invalid credentials cause it
+to exit. Credential environment variables are removed before any runtime CLI
+invocation. `env`, `/proc/1/environ`, and the container's inspected environment
+do not contain the proxy credentials. New `podman exec` / `docker exec`
+processes do not inherit them either.
+
+Credentials remain in Python memory for subsequent Digest challenges and in
+runtime storage so the container can restart automatically. Container root,
+engine administrators, or a process with access to bridge memory can read them.
+If credentials were exported in your calling shell, unset them there after
+startup when no longer needed.
+
+To permanently remove credentials, use the same runtime/connection that started
+the bridge. Remove the stopped container first. With Podman, remove the secret
+`squid-digest-bridge-credentials`. With Docker, find the credential volume in the
+container label `io.squid-digest-bridge.credentials` before removing the
+container, then remove that volume. Volume names start with
+`squid-digest-bridge-credentials-`. OrbStack uses the Docker commands with
+`--context orbstack`. Failed cleanup may leave unused credential volumes;
+inspect project-labeled volumes before removing them.
 
 Run the local regression checks with `python3 -m unittest discover -s tests`.
+The CLI fixtures cover Podman, Docker, and OrbStack selection and lifecycle,
+including credential bytes, permissions, rotation, and failure cleanup.
+
+For an opt-in live smoke test against a running engine, use
+`python3 tests/smoke_runtime.py podman` (or `docker` / `orbstack`). It uses an
+isolated repository copy, a unique container and spare port, dummy credentials,
+and a simulated Digest upstream inside the container. It verifies authenticated
+CONNECT, tunnel data, restart, replacement, credential isolation, and shutdown,
+then removes its containers and credential storage. It does not contact a
+corporate proxy or an external destination.
