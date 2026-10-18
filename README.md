@@ -45,7 +45,9 @@ export HTTPS_PROXY="http://bridge:$(cat .bridge-client-token)@127.0.0.1:8080"
 The local token grants access to the bridge; it is separate from the corporate
 username/password. Startup generates it automatically, protects the file with
 mode `0600`, and reuses it across restarts and shutdown. It is ignored by Git
-and mounted read-only into the bridge. It is never passed in runtime command
+and mounted read-only at `/run/bridge/bridge_client_token`, outside the
+corporate credential volume at `/run/secrets`. This lets Docker/OrbStack create
+both mountpoints without writing inside a read-only volume. It is never passed in runtime command
 arguments or container environment variables. Requests without valid local
 credentials return `407 Proxy Authentication Required` before any outbound
 connection. The local authentication header is never forwarded to Squid or a

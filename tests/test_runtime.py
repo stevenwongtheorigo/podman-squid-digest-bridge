@@ -365,7 +365,7 @@ class RuntimeTests(unittest.TestCase):
         token = path.read_text().strip()
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertNotIn(token, (self.root / "calls").read_text())
-        self.assertIn(str(path) + ":/run/secrets/bridge_client_token:ro", self.model()["container"]["args"])
+        self.assertIn(str(path) + ":/run/bridge/bridge_client_token:ro", self.model()["container"]["args"])
         self.run_script()
         self.assertEqual(path.read_text().strip(), token)
 
@@ -377,6 +377,25 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_script(success=False)
         self.assertIn("Invalid local client token", result.stderr)
         self.assertEqual(self.model(), before)
+
+    def test_docker_token_mount_has_no_read_only_parent_mount(self):
+        self.install("docker")
+        self.run_script()
+        args = self.model()["container"]["args"]
+        targets = []
+        for index, argument in enumerate(args):
+            if argument == "--volume":
+                _, target, options = args[index + 1].rsplit(":", 2)
+                targets.append((target, "ro" in options.split(",")))
+            elif argument == "--mount":
+                fields = args[index + 1].split(",")
+                target = next(field.split("=", 1)[1] for field in fields if field.startswith("target="))
+                targets.append((target, "readonly" in fields))
+        for target, _ in targets:
+            for parent, read_only in targets:
+                if read_only:
+                    self.assertFalse(target.startswith(parent + "/"),
+                                     f"Mount {target} requires creating a mountpoint inside read-only {parent}")
 
 
 if __name__ == "__main__":

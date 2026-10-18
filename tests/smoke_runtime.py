@@ -107,8 +107,12 @@ def main(kind):
                    PROXY_DIGEST_USER="smoke-user", PROXY_DIGEST_PASS="smoke-password")
 
         def script(filename):
-            return subprocess.run(["/bin/bash", filename], cwd=root, env=env, check=True,
-                                  capture_output=True, text=True).stdout
+            result = subprocess.run(["/bin/bash", filename], cwd=root, env=env,
+                                    capture_output=True, text=True)
+            if result.returncode:
+                print(result.stderr, file=sys.stderr)
+                result.check_returncode()
+            return result.stdout
 
         def runtime(*args, check=True):
             clean_env = {key: value for key, value in env.items() if not key.startswith("PROXY_DIGEST_")}

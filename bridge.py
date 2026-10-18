@@ -97,7 +97,7 @@ def parse_connect_target(target):
 
 def load_client_token():
     try:
-        token = Path("/run/secrets/bridge_client_token").read_bytes().strip()
+        token = Path("/run/bridge/bridge_client_token").read_bytes().strip()
     except OSError:
         raise SystemExit("Unable to read local client token; start with ./startup.sh") from None
     if re.fullmatch(rb"[A-Za-z0-9_-]{32,128}", token) is None:

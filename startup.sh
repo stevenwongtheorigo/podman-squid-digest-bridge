@@ -80,7 +80,9 @@ fi
 chmod 600 "$client_token_file"
 token_options=ro
 [ "$runtime_kind" != podman ] || token_options=ro,Z
-client_args=(--volume "$PWD/$client_token_file:/run/secrets/bridge_client_token:$token_options")
+# Keep this mount outside the read-only corporate credential volume. Docker
+# cannot create a new file mountpoint inside that volume during container init.
+client_args=(--volume "$PWD/$client_token_file:/run/bridge/bridge_client_token:$token_options")
 runtime run --rm --network none "${config_args[@]}" "${client_args[@]}" \
     "$image" python /app/bridge.py --check-client-token
 

@@ -94,7 +94,7 @@ elif args[0] == "run":
         print("test-client-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
     elif "--check-client-token" in args:
         mounts = dict(value.rsplit(":", 2)[1::-1] for i, value in enumerate(args) if i and args[i - 1] == "--volume")
-        code = Path(mounts["/app/bridge.py"]).read_text().replace("/run/secrets/bridge_client_token", mounts["/run/secrets/bridge_client_token"])
+        code = Path(mounts["/app/bridge.py"]).read_text().replace("/run/bridge/bridge_client_token", mounts["/run/bridge/bridge_client_token"])
         subprocess.run([sys.executable, "-c", code, "--check-client-token"], check=True)
     elif "--check-config" in args:
         fail("config")
