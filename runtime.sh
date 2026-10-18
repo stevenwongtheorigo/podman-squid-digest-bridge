@@ -15,6 +15,7 @@ load_settings() {
                 UPSTREAM_SQUID_HOST) UPSTREAM_SQUID_HOST=${UPSTREAM_SQUID_HOST-$value} ;;
                 UPSTREAM_SQUID_PORT) UPSTREAM_SQUID_PORT=${UPSTREAM_SQUID_PORT-$value} ;;
                 CONTAINER_RUNTIME) CONTAINER_RUNTIME=${CONTAINER_RUNTIME-$value} ;;
+                PROXY_DOMAINS_FILE) PROXY_DOMAINS_FILE=${PROXY_DOMAINS_FILE-$value} ;;
             esac
         done < .env
     fi

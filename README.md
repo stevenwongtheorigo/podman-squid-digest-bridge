@@ -6,6 +6,9 @@ proxy at `http://127.0.0.1:8080`; the bridge handles corporate authentication,
 so the agent does not need the corporate username or password in its proxy
 configuration.
 
+Optionally route only selected domains through Squid and connect to everything
+else directly from the bridge container.
+
 ```mermaid
 flowchart TD
     agent["Coding agent / Codex tools"]
@@ -19,6 +22,7 @@ flowchart TD
     corporate -->|"Digest challenge"| bridge
     bridge -->|"Digest response; no plaintext password"| corporate
     corporate -->|"Tunnel to destination"| destination
+    bridge -->|"Unlisted destination: direct tunnel"| destination
     user -.->|"Standard input"| secret
     secret -.->|"Read once into memory"| bridge
 ```
@@ -34,6 +38,51 @@ Configure the agent's proxy-aware tools to use `http://127.0.0.1:8080` from the
 host running the bridge. These tools must support an HTTP proxy for HTTPS
 CONNECT requests. The bridge currently supports HTTPS tunnels only; ordinary
 HTTP requests return `501 Not Implemented`.
+
+To enable selective routing, copy `proxy-domains.txt.sample` to
+`proxy-domains.txt`, edit the domains, and set this in `.env`:
+
+```dotenv
+PROXY_DOMAINS_FILE=proxy-domains.txt
+```
+
+Relative paths resolve beside `startup.sh`; absolute paths also work. The
+default `proxy-domains.txt` is ignored by Git. Use one hostname rule per line:
+
+```text
+api.example.com     # Only api.example.com
+.example.net        # example.net and every subdomain
+```
+
+The syntax follows Squid's [hostname matching rules](https://wiki.squid-cache.org/SquidFaq/SquidAcl).
+Matching ignores case and a single trailing DNS dot, and respects domain
+boundaries: `.example.net` never matches `notexample.net` or
+`example.net.other`. Blank lines and `#` comments are allowed. Rules accept ASCII
+hostnames, including punycode; wildcards such as `*.example.com`, URLs, IP
+addresses, ports, and complete `acl` declarations are rejected. When a list is
+configured, literal IPv4/IPv6 destinations go direct; no reverse DNS is used to
+decide the route.
+
+| Domain configuration | Behavior |
+| --- | --- |
+| `PROXY_DOMAINS_FILE` unset or empty | All destinations use Squid, preserving the default behavior |
+| Configured file contains rules | Matches use Squid; other destinations go direct |
+| Configured file is empty or contains only comments | All destinations go direct; no upstream settings or credentials needed |
+| Configured file is missing, unreadable, or invalid | Startup fails before credentials or container replacement |
+
+Routing is strict: neither route falls back to the other when it fails. Direct
+connections resolve DNS inside the container and use its network reachability.
+The bridge sends `200 Connection established` only after opening the direct
+connection; it never sends the proxy CONNECT headers or corporate credentials
+to the destination. Connection failures return `502 Bad Gateway`; a 10-second
+connection/negotiation timeout returns `504 Gateway Timeout`. Invalid CONNECT
+targets return `400 Bad Request`. Squid rejection responses are forwarded to
+the client without a direct retry.
+
+Startup validates configured lists inside the Python image, using the same
+parser as the bridge, and mounts the file read-only. Rules are loaded once per
+process; editing the file does not change a running bridge's routing. Rerun
+`./startup.sh` to validate and apply edits.
 
 Install and start one of these Linux container runtimes:
 
@@ -55,7 +104,8 @@ An installed engine that cannot connect causes an error, with no automatic
 fallback. Missing CLIs produce installation help before any credential prompt.
 
 Copy `.env.sample` to `.env` and set `UPSTREAM_SQUID_HOST` and
-`UPSTREAM_SQUID_PORT` to your upstream proxy endpoint. Use plain, unquoted
+`UPSTREAM_SQUID_PORT` to your upstream proxy endpoint, unless using an empty
+domain file for direct-only operation. Use plain, unquoted
 `KEY=value` entries. The `.env` file is ignored by Git.
 
 Optionally set `CONTAINER_RUNTIME` in `.env`, or override it for one invocation:
@@ -65,8 +115,8 @@ CONTAINER_RUNTIME=orbstack ./startup.sh
 # Or: CONTAINER_RUNTIME=docker ./startup.sh
 ```
 
-Run `./startup.sh`. The script prompts for your username and password, with
-password input hidden:
+Run `./startup.sh`. When Squid is needed, the script prompts for your username
+and password, with password input hidden:
 
 ```sh
 ./startup.sh
@@ -88,9 +138,10 @@ This stops the container and preserves its credentials. Run `./startup.sh`
 to start again with fresh credentials.
 
 `startup.sh` reads `UPSTREAM_SQUID_HOST`, `UPSTREAM_SQUID_PORT`, and
-`CONTAINER_RUNTIME` from `.env` beside the script. Exported variables override
-`.env` values. Both upstream settings are required; there are no built-in
-defaults. Values are literal, unquoted text; other entries, including
+`CONTAINER_RUNTIME`, and `PROXY_DOMAINS_FILE` from `.env` beside the script.
+Exported variables override `.env` values. Both upstream settings are required
+when Squid is needed; there are no built-in defaults. Values are literal,
+unquoted text; other entries, including
 credentials, are ignored. `runtime.sh` shares configuration and connection
 handling between the startup and shutdown scripts.
 
@@ -133,9 +184,13 @@ replacement removes the previous container's credential volume; shutdown keeps
 the current one for automatic restarts. Docker volumes are persistent storage,
 not Docker Swarm secrets, and have no application-level encryption.
 
-The bridge reads credentials once at startup, before listening, and unsets the
-two upstream configuration variables. Missing or invalid credentials cause it
-to exit. Credential environment variables are removed before any runtime CLI
+When Squid is needed, the bridge reads credentials once at startup, before
+listening. Missing or invalid credentials cause it to exit. Direct-only mode
+does not read, create, or mount credentials. Switching to direct-only mode
+removes the previous Docker credential volume; an existing Podman secret is
+retained in runtime storage but is not mounted. The bridge consumes routing and
+upstream configuration variables at startup. Credential environment variables
+are removed before any runtime CLI
 invocation. `env`, `/proc/1/environ`, and the container's inspected environment
 do not contain the proxy credentials. New `podman exec` / `docker exec`
 processes do not inherit them either.
@@ -157,12 +212,15 @@ inspect project-labeled volumes before removing them.
 
 Run the local regression checks with `python3 -m unittest discover -s tests`.
 The CLI fixtures cover Podman, Docker, and OrbStack selection and lifecycle,
-including credential bytes, permissions, rotation, and failure cleanup.
+including credential bytes, permissions, rotation, and failure cleanup. Routing
+tests cover domain syntax, matching boundaries, direct and Digest tunnels,
+gateway failures, and absence of route fallback.
 
 For an opt-in live smoke test against a running engine, use
 `python3 tests/smoke_runtime.py podman` (or `docker` / `orbstack`). It uses an
 isolated repository copy, a unique container and spare port, dummy credentials,
-and a simulated Digest upstream inside the container. It verifies authenticated
-CONNECT, tunnel data, restart, replacement, credential isolation, and shutdown,
+and simulated Digest and direct destinations inside the container. It verifies
+both routes, strict failure behavior, restart, replacement, credential isolation,
+direct-only startup without upstream settings/credentials, and shutdown,
 then removes its containers and credential storage. It does not contact a
 corporate proxy or an external destination.

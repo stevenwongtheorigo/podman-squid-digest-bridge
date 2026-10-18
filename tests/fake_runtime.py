@@ -74,7 +74,14 @@ elif args[:2] == ["volume", "rm"]:
     shutil.rmtree(root / name)
     save()
 elif args[0] == "run":
-    if "--interactive" in args:
+    if "--check-config" in args:
+        fail("config")
+        settings = dict(value.split("=", 1) for i, value in enumerate(args) if i and args[i - 1] == "--env")
+        mounts = dict(value.rsplit(":", 2)[1::-1] for i, value in enumerate(args) if i and args[i - 1] == "--volume")
+        settings["PROXY_DOMAINS_FILE"] = mounts[settings["PROXY_DOMAINS_FILE"]]
+        subprocess.run([sys.executable, mounts["/app/bridge.py"], "--check-config"],
+                       env=dict(os.environ, **settings), check=True)
+    elif "--interactive" in args:
         fail("helper")
         name = option("--mount").split("source=", 1)[1].split(",", 1)[0]
         # Execute the real credential-writer code with only its mount path mapped

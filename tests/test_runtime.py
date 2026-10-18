@@ -256,6 +256,80 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse((self.root / "unexpected").exists())
         self.assertEqual(self.calls(), [])
 
+    def test_empty_policy_skips_upstream_and_credentials_on_every_runtime(self):
+        self.install("docker")
+        self.install("podman")
+        (self.root / "empty domains.txt").write_text("# direct only\n\n")
+        (self.root / ".env").write_text("PROXY_DOMAINS_FILE=empty domains.txt\n")
+        del self.env["UPSTREAM_SQUID_HOST"]
+        del self.env["UPSTREAM_SQUID_PORT"]
+        self.env["PROXY_DIGEST_USER"] = ""
+        self.env["PROXY_DIGEST_PASS"] = ""
+        for kind in ("podman", "docker", "orbstack"):
+            with self.subTest(kind=kind):
+                start = len(self.calls())
+                self.run_script(CONTAINER_RUNTIME=kind)
+                args = self.model()["container"]["args"]
+                self.assertIn("PROXY_DOMAINS_FILE=/app/proxy-domains.txt", args)
+                suffix = ":ro,z" if kind == "podman" else ":ro"
+                self.assertIn(str(self.root / "empty domains.txt") + ":/app/proxy-domains.txt" + suffix, args)
+                self.assertFalse(any("UPSTREAM_SQUID_" in value for value in args))
+                self.assertNotIn("--secret", args)
+                self.assertNotIn("--mount", args)
+                self.assertFalse(any("secret" in values or "--interactive" in values or values[:2] == ["volume", "create"]
+                                     for _, values in self.calls()[start:]))
+                self.run_script("shutdown.sh")
+
+    def test_nonempty_policy_mounts_rules_and_still_creates_credentials(self):
+        self.install("docker")
+        path = self.root / "domains.txt"
+        path.write_text("example.com\n.example.net\n")
+        self.run_script(PROXY_DOMAINS_FILE=str(path))
+        args = self.model()["container"]["args"]
+        self.assertIn("PROXY_DOMAINS_FILE=/app/proxy-domains.txt", args)
+        self.assertIn("UPSTREAM_SQUID_HOST=upstream.example.com", args)
+        self.assertTrue(self.model()["container"]["credentials"])
+
+    def test_bad_policy_leaves_existing_container_and_credentials_untouched(self):
+        self.install("docker")
+        self.run_script()
+        before = self.model()
+        path = self.root / "domains.txt"
+        for content in (None, "*.example.com", "acl domains dstdomain .example.com", "example.com:443"):
+            with self.subTest(content=content):
+                if content is not None:
+                    path.write_text(content)
+                start = len(self.calls())
+                self.run_script(success=False, PROXY_DOMAINS_FILE=str(path), PROXY_DIGEST_USER="", PROXY_DIGEST_PASS="")
+                self.assertEqual(self.model(), before)
+                self.assertFalse(any("secret" in values or "--interactive" in values or "rm" in values
+                                     for _, values in self.calls()[start:]))
+
+    def test_empty_policy_override_takes_precedence_over_env_file(self):
+        self.install("docker")
+        (self.root / ".env").write_text("PROXY_DOMAINS_FILE=missing.txt\n")
+        (self.root / "empty.txt").write_text("")
+        self.run_script(PROXY_DOMAINS_FILE=str(self.root / "empty.txt"))
+        self.assertEqual(self.model()["volumes"], [])
+
+    def test_switching_to_direct_only_removes_old_docker_credential_volume(self):
+        self.install("docker")
+        self.run_script()
+        old_volume = self.model()["container"]["credentials"]
+        (self.root / "empty.txt").write_text("")
+        self.run_script(PROXY_DOMAINS_FILE=str(self.root / "empty.txt"), PROXY_DIGEST_USER="", PROXY_DIGEST_PASS="")
+        self.assertEqual(self.model()["volumes"], [])
+        self.assertFalse((self.root / old_volume).exists())
+        self.run_script()
+        self.assertEqual(len(self.model()["volumes"]), 1)
+
+    def test_failed_direct_only_launch_is_cleaned_up(self):
+        self.install("docker")
+        (self.root / "empty.txt").write_text("")
+        self.run_script(success=False, TEST_FAIL="run", PROXY_DOMAINS_FILE=str(self.root / "empty.txt"))
+        self.assertEqual(self.model(), {"container": None, "volumes": []})
+        self.assertFalse((self.root / ".bridge-runtime").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
