@@ -1,5 +1,11 @@
 # Squid Digest Bridge
 
+Install [Podman](https://podman.io/docs/installation) before starting. If Podman
+is missing from `PATH`, `startup.sh` detects your operating system (macOS,
+Windows, or Linux) and prints the relevant installation instructions before
+exiting, without requesting configuration or credentials. WSL uses the Linux
+instructions.
+
 Copy `.env.sample` to `.env` and set `UPSTREAM_SQUID_HOST` and
 `UPSTREAM_SQUID_PORT` to your upstream proxy endpoint. Use plain, unquoted
 `KEY=value` entries. The `.env` file is ignored by Git.

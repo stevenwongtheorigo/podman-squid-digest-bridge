@@ -14,6 +14,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CredentialTests(unittest.TestCase):
+    def test_missing_podman_shows_installation_help_before_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            startup = Path(directory) / "startup.sh"
+            shutil.copy2(ROOT / "startup.sh", startup)
+            uname = Path(directory) / "uname"
+            uname.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_OS"\n')
+            uname.chmod(0o700)
+            for system, heading in (("Darwin", "macOS:"),
+                                    ("MINGW64_NT-10.0", "Windows:"),
+                                    ("MSYS_NT-10.0", "Windows:"),
+                                    ("CYGWIN_NT-10.0", "Windows:"),
+                                    ("Windows_NT", "Windows:"),
+                                    ("Linux", "Linux:"),
+                                    ("FreeBSD", None)):
+                with self.subTest(system=system):
+                    result = subprocess.run(
+                        ["/bin/bash", str(startup)],
+                        env={"PATH": directory, "TEST_OS": system},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 127)
+                    self.assertIn("Podman is not installed", result.stderr)
+                    self.assertIn("https://podman.io/docs/installation", result.stderr)
+                    for platform in ("macOS:", "Windows:", "Linux:"):
+                        if platform == heading:
+                            self.assertIn(platform, result.stderr)
+                        else:
+                            self.assertNotIn(platform, result.stderr)
+                    if heading in ("macOS:", "Windows:"):
+                        self.assertIn("podman machine init", result.stderr)
+                        self.assertIn("podman machine start", result.stderr)
+                    self.assertIn("./startup.sh again", result.stderr)
+                    self.assertNotIn("command not found", result.stderr)
+                    self.assertNotIn("Proxy username:", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
     def setUp(self):
         self.environment = patch.dict(os.environ, {
             "UPSTREAM_SQUID_HOST": "proxy.example.com",
