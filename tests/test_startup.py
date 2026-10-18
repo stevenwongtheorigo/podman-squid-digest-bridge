@@ -3,6 +3,7 @@ from pathlib import Path
 import runpy
 import unittest
 from unittest.mock import patch
+from test_routing import CLIENT_TOKEN
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,7 @@ class CredentialTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
 
     def load_bridge(self, payload):
-        with patch.object(Path, "read_bytes", return_value=payload):
+        with patch.object(Path, "read_bytes", lambda path: CLIENT_TOKEN if path.name == "bridge_client_token" else payload):
             return runpy.run_path(str(ROOT / "bridge.py"))
 
     def test_secret_authenticates_without_environment_credentials(self):

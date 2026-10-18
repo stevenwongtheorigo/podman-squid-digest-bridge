@@ -2,6 +2,8 @@
 # Shared by startup.sh and shutdown.sh; configuration/state is parsed, never sourced.
 
 container_name=squid-digest-bridge
+network_name=$container_name-network
+client_token_file=.bridge-client-token
 image=docker.io/library/python:3.12-alpine
 managed_label=io.squid-digest-bridge.managed
 credentials_label=io.squid-digest-bridge.credentials
@@ -15,6 +17,7 @@ load_settings() {
                 UPSTREAM_SQUID_HOST) UPSTREAM_SQUID_HOST=${UPSTREAM_SQUID_HOST-$value} ;;
                 UPSTREAM_SQUID_PORT) UPSTREAM_SQUID_PORT=${UPSTREAM_SQUID_PORT-$value} ;;
                 CONTAINER_RUNTIME) CONTAINER_RUNTIME=${CONTAINER_RUNTIME-$value} ;;
+                PROXY_DOMAINS_FILE) PROXY_DOMAINS_FILE=${PROXY_DOMAINS_FILE-$value} ;;
             esac
         done < .env
     fi

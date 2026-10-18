@@ -1,0 +1,4 @@
+# Copy to proxy-domains.txt and set PROXY_DOMAINS_FILE=proxy-domains.txt in .env.
+# Only these destinations use Squid; all other destinations connect directly.
+api.example.com    # Exact hostname only
+.example.net       # Domain and all its subdomains

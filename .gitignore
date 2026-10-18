@@ -2,3 +2,6 @@
 __pycache__/
 .bridge-runtime
 .bridge-runtime.*
+proxy-domains.txt
+.bridge-client-token
+.bridge-client-token.*
