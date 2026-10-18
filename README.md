@@ -1,5 +1,39 @@
 # Squid Digest Bridge
 
+Let a coding agent such as Codex reach HTTPS services through a corporate Squid
+proxy that requires Digest authentication. The agent's tools use the local
+proxy at `http://127.0.0.1:8080`; the bridge handles corporate authentication,
+so the agent does not need the corporate username or password in its proxy
+configuration.
+
+```mermaid
+flowchart TD
+    agent["Coding agent / Codex tools"]
+    bridge["Local Podman bridge<br/>127.0.0.1:8080"]
+    corporate["Corporate Squid proxy"]
+    destination["HTTPS service"]
+    user["User enters credentials<br/>at startup.sh prompt"]
+    secret["Podman secret<br/>Protected credential file"]
+
+    agent -->|"HTTPS CONNECT; no corporate credentials"| bridge
+    corporate -->|"Digest challenge"| bridge
+    bridge -->|"Digest response; no plaintext password"| corporate
+    corporate -->|"Tunnel to destination"| destination
+    user -.->|"Standard input"| secret
+    secret -.->|"Read once into memory"| bridge
+```
+
+Passwords are not saved in `.env`, passed as Podman command arguments, or
+injected into the container environment. **Credentials are stored in a Podman
+secret and retained in bridge memory**; the secret survives shutdown and is
+not encrypted by default. Digest authentication sends a computed response
+instead of the plaintext password to the corporate proxy.
+
+Configure the agent's proxy-aware tools to use `http://127.0.0.1:8080` from the
+host running the bridge. These tools must support an HTTP proxy for HTTPS
+CONNECT requests. The bridge currently supports HTTPS tunnels only; ordinary
+HTTP requests return `501 Not Implemented`.
+
 Install [Podman](https://podman.io/docs/installation) before starting. If Podman
 is missing from `PATH`, `startup.sh` detects your operating system (macOS,
 Windows, or Linux) and prints the relevant installation instructions before
