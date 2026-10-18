@@ -35,7 +35,23 @@ def option(name):
     return args[args.index(name) + 1]
 
 
-if args[:3] == ["system", "connection", "list"]:
+if args[:2] == ["network", "inspect"]:
+    fail("network-inspect")
+    network_file = root / "networks.json"
+    networks = json.loads(network_file.read_text()) if network_file.exists() else {}
+    if args[-1] not in networks:
+        sys.exit(1)
+    if "--format" in args:
+        print(networks[args[-1]])
+elif args[:2] == ["network", "create"]:
+    fail("network")
+    network_file = root / "networks.json"
+    networks = json.loads(network_file.read_text()) if network_file.exists() else {}
+    if args[-1] in networks:
+        sys.exit(1)
+    networks[args[-1]] = option("--label").split("=", 1)[1]
+    network_file.write_text(json.dumps(networks))
+elif args[:3] == ["system", "connection", "list"]:
     print(os.environ.get("TEST_PODMAN_CONNECTION", "podman-machine-default"))
 elif args == ["context", "show"]:
     print(os.environ.get("DOCKER_CONTEXT") or os.environ.get("TEST_DOCKER_CONTEXT", "desktop-linux"))
@@ -74,7 +90,13 @@ elif args[:2] == ["volume", "rm"]:
     shutil.rmtree(root / name)
     save()
 elif args[0] == "run":
-    if "--check-config" in args:
+    if args[-1] == 'import secrets; print(secrets.token_urlsafe(32))':
+        print("test-client-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    elif "--check-client-token" in args:
+        mounts = dict(value.rsplit(":", 2)[1::-1] for i, value in enumerate(args) if i and args[i - 1] == "--volume")
+        code = Path(mounts["/app/bridge.py"]).read_text().replace("/run/secrets/bridge_client_token", mounts["/run/secrets/bridge_client_token"])
+        subprocess.run([sys.executable, "-c", code, "--check-client-token"], check=True)
+    elif "--check-config" in args:
         fail("config")
         settings = dict(value.split("=", 1) for i, value in enumerate(args) if i and args[i - 1] == "--env")
         mounts = dict(value.rsplit(":", 2)[1::-1] for i, value in enumerate(args) if i and args[i - 1] == "--volume")

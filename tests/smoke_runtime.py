@@ -5,6 +5,7 @@ copy, a unique container name, and a spare localhost port. No external proxy
 or HTTPS service is contacted.
 """
 import json
+import base64
 import os
 from pathlib import Path
 import socket
@@ -111,18 +112,26 @@ def main(kind):
 
         def runtime(*args, check=True):
             clean_env = {key: value for key, value in env.items() if not key.startswith("PROXY_DIGEST_")}
-            return subprocess.run(
+            result = subprocess.run(
                 ["/bin/bash", "-c", 'set -euo pipefail; source ./runtime.sh; '
                  'if [ -f "$state_file" ]; then load_runtime_state; else select_runtime; fi; runtime "$@"',
-                 "smoke", *args], cwd=root, env=clean_env, check=check, capture_output=True, text=True,
-            ).stdout
+                 "smoke", *args], cwd=root, env=clean_env, capture_output=True, text=True,
+            )
+            if check and result.returncode:
+                print(result.stderr, file=sys.stderr)
+                result.check_returncode()
+            return result.stdout
 
-        def probe(target="smoke.example:443", expected=b"smoke tunnel payload", status=b"200", half_close=False):
+        def probe(target="smoke.example:443", expected=b"smoke tunnel payload", status=b"200", half_close=False, authenticated=True):
             deadline = time.monotonic() + 20
             while True:
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
-                        connection.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                        auth = b""
+                        if authenticated:
+                            token = (root / ".bridge-client-token").read_bytes().strip()
+                            auth = b"Proxy-Authorization: Basic " + base64.b64encode(b"bridge:" + token) + b"\r\n"
+                        connection.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n".encode() + auth + b"\r\n")
                         headers = b""
                         while not headers.endswith(b"\r\n\r\n"):
                             piece = connection.recv(1)
@@ -151,6 +160,32 @@ def main(kind):
         try:
             script("startup.sh")
             probe()
+            probe(status=b"407", authenticated=False)
+            inspected = json.loads(runtime("inspect", name))[0]
+            bridge_ip = inspected["NetworkSettings"]["Networks"][name + "-network"]["IPAddress"]
+            runtime("network", "create", name + "-peer-network")
+            # Positive control on the bridge's own network, followed by probes
+            # from an unrelated network and the engine's default network.
+            network_probe = r'''
+import socket, sys
+try:
+    connection = socket.create_connection((sys.argv[1], 8080), timeout=2)
+except OSError:
+    if sys.argv[2] == "allowed":
+        raise
+else:
+    if sys.argv[2] == "blocked":
+        connection.sendall(b"CONNECT smoke.example:443 HTTP/1.1\r\n\r\n")
+        response = connection.recv(4096)
+        if not response.startswith(b"HTTP/1.1 407 "):
+            raise SystemExit("Unrelated container can use the bridge without its client token")
+    connection.close()
+'''
+            for network, expected in ((name + "-network", "allowed"),
+                                      (name + "-peer-network", "blocked"),
+                                      ("podman" if kind == "podman" else "bridge", "blocked")):
+                runtime("run", "--rm", "--name", name + "-peer", "--network", network,
+                        "docker.io/library/python:3.12-alpine", "python", "-c", network_probe, bridge_ip, expected)
             probe("127.0.0.1:3130", b"direct:smoke tunnel payload")
             probe("127.0.0.1:3131", b"after-eof:smoke tunnel payload", half_close=True)
             probe("smoke.example:3130", status=b"403")
@@ -176,8 +211,9 @@ def main(kind):
                            for mount in inspected["Mounts"])
             script("shutdown.sh")
             assert json.loads(runtime("inspect", name))[0]["State"]["Running"] is False
-            print(f"PASS {kind}: Digest and direct tunnels, strict routing failures, restart, replacement, direct-only startup without credentials, shutdown")
+            print(f"PASS {kind}: local and peer-container authentication, Digest and direct tunnels, strict routing failures, restart, replacement, direct-only startup without corporate credentials, shutdown")
         finally:
+            runtime("rm", "--force", name + "-peer", check=False)
             runtime("rm", "--force", name, check=False)
             if kind == "podman":
                 runtime("secret", "rm", name + "-credentials", check=False)
@@ -185,6 +221,8 @@ def main(kind):
                 volumes = runtime("volume", "ls", "--filter", f"label=io.{name}.managed=true", "--format", "{{.Name}}", check=False)
                 for volume in volumes.splitlines():
                     runtime("volume", "rm", volume, check=False)
+            runtime("network", "rm", name + "-peer-network", check=False)
+            runtime("network", "rm", name + "-network", check=False)
 
 
 if __name__ == "__main__":

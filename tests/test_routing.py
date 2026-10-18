@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 from pathlib import Path
 import runpy
@@ -7,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CLIENT_TOKEN = b"test-client-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLIENT_AUTH_HEADER = b"Proxy-Authorization: Basic " + base64.b64encode(b"bridge:" + CLIENT_TOKEN) + b"\r\n"
 
 
 def load_bridge(rules=None, **environment):
@@ -16,7 +19,7 @@ def load_bridge(rules=None, **environment):
         settings["PROXY_DOMAINS_FILE"] = "/app/proxy-domains.txt"
     with patch.dict(os.environ, settings, clear=True), \
             patch.object(Path, "read_text", return_value=rules), \
-            patch.object(Path, "read_bytes", return_value=b"user\0password"):
+            patch.object(Path, "read_bytes", lambda path: CLIENT_TOKEN if path.name == "bridge_client_token" else b"user\0password"):
         loaded = runpy.run_path(str(ROOT / "bridge.py"))
     return loaded["handle_client"].__globals__
 
@@ -66,7 +69,11 @@ class DomainTests(unittest.TestCase):
                 self.bridge["parse_connect_target"](target)
 
     def test_direct_only_does_not_require_upstream_settings_or_read_secrets(self):
-        with patch.object(Path, "read_bytes", side_effect=AssertionError("Secret accessed")):
+        def read_secret(path):
+            if path.name == "bridge_client_token":
+                return CLIENT_TOKEN
+            raise AssertionError("Corporate secret accessed")
+        with patch.object(Path, "read_bytes", read_secret):
             # run_path needs no secret patch in this test: only an empty policy.
             with patch.dict(os.environ, {"PROXY_DOMAINS_FILE": "domains.txt"}, clear=True), \
                     patch.object(Path, "read_text", return_value="# all direct\n"):
@@ -122,7 +129,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.client = Writer()
 
     async def request(self, target, payload=b"", method="CONNECT"):
-        stream = reader(f"{method} {target} HTTP/1.1\r\nHost: ignored.example\r\nProxy-Authorization: client-secret\r\n\r\n".encode() + payload)
+        stream = reader(f"{method} {target} HTTP/1.1\r\nHost: ignored.example\r\n".encode() + CLIENT_AUTH_HEADER + b"\r\n" + payload)
         await self.bridge["handle_client"](stream, self.client)
         self.assertTrue(self.client.closed)
         return bytes(self.client.data)
@@ -159,7 +166,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(call.args == ("squid.example", 3128) for call in connect.await_args_list))
         self.assertNotIn(b"Proxy-Authorization:", first.data)
         self.assertIn(b'Proxy-Authorization: Digest username="user"', authenticated.data)
-        self.assertNotIn(b"client-secret", first.data + authenticated.data)
+        self.assertNotIn(CLIENT_AUTH_HEADER, first.data + authenticated.data)
         self.assertTrue(authenticated.data.endswith(b"\r\n\r\nclient tunnel"))
         self.assertTrue(response.endswith(b"upstream tunnel"))
         self.assertTrue(first.closed)
@@ -176,7 +183,10 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                         response = await self.request(target)
                     self.assertIn(status, response)
                     self.assertNotIn(b"200 Connection", response)
-                    connect.assert_awaited_once_with(expected_host, 3128 if expected_host == "squid.example" else 443)
+                    if expected_host == "squid.example":
+                        connect.assert_awaited_once_with(expected_host, 3128, limit=self.bridge["MAX_HEADER_BYTES"])
+                    else:
+                        connect.assert_awaited_once_with(expected_host, 443)
 
     async def test_upstream_header_timeout_closes_connection_without_fallback(self):
         upstream = Writer()
@@ -186,7 +196,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             response = await self.request("proxied.example:443")
         self.assertIn(b"504 Gateway Timeout", response)
         self.assertTrue(upstream.closed)
-        connect.assert_awaited_once_with("squid.example", 3128)
+        connect.assert_awaited_once_with("squid.example", 3128, limit=self.bridge["MAX_HEADER_BYTES"])
 
     async def test_upstream_rejection_is_forwarded_without_fallback(self):
         upstream = Writer()

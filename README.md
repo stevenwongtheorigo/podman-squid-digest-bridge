@@ -2,7 +2,7 @@
 
 Let a coding agent such as Codex reach HTTPS services through a corporate Squid
 proxy that requires Digest authentication. The agent's tools use the local
-proxy at `http://127.0.0.1:8080`; the bridge handles corporate authentication,
+proxy at `127.0.0.1:8080`, authenticated with a separate local token; the bridge handles corporate authentication,
 so the agent does not need the corporate username or password in its proxy
 configuration.
 
@@ -27,15 +27,32 @@ flowchart TD
     secret -.->|"Read once into memory"| bridge
 ```
 
-Passwords are not saved in `.env`, passed as runtime command arguments, or
-injected into the container environment. **Credentials are retained in bridge
+Corporate passwords are not saved in `.env`, passed as runtime command arguments, or
+injected into the container environment. **Corporate credentials are retained in bridge
 memory and persistent runtime storage**: a Podman secret or a Docker volume.
 These stores survive shutdown and have no application-level encryption. Digest
 authentication sends a computed response instead of the plaintext password to
 the corporate proxy.
 
-Configure the agent's proxy-aware tools to use `http://127.0.0.1:8080` from the
-host running the bridge. These tools must support an HTTP proxy for HTTPS
+After startup, configure the agent's proxy-aware tools with username `bridge`
+and the local token in `.bridge-client-token`. For tools using `HTTPS_PROXY`,
+run this from the repository directory:
+
+```sh
+export HTTPS_PROXY="http://bridge:$(cat .bridge-client-token)@127.0.0.1:8080"
+```
+
+The local token grants access to the bridge; it is separate from the corporate
+username/password. Startup generates it automatically, protects the file with
+mode `0600`, and reuses it across restarts and shutdown. It is ignored by Git
+and mounted read-only into the bridge. It is never passed in runtime command
+arguments or container environment variables. Requests without valid local
+credentials return `407 Proxy Authentication Required` before any outbound
+connection. The local authentication header is never forwarded to Squid or a
+direct destination. To rotate the token, remove `.bridge-client-token`, rerun
+`./startup.sh`, and update your tools' proxy configuration.
+
+Use the proxy from the host running the bridge. Tools must support an HTTP proxy for HTTPS
 CONNECT requests. The bridge currently supports HTTPS tunnels only; ordinary
 HTTP requests return `501 Not Implemented`.
 
@@ -137,6 +154,32 @@ Stop the bridge with:
 This stops the container and preserves its credentials. Run `./startup.sh`
 to start again with fresh credentials.
 
+The bridge joins a dedicated project-managed network named
+`squid-digest-bridge-network`, rather than the engine's default network.
+Startup refuses to reuse an unmanaged network with that name. The host port
+remains bound to `127.0.0.1`. Client authentication also protects access on
+runtimes where bridge networks are not isolated from one another. Treat the
+host and container-engine administrators as trusted; do not attach untrusted
+containers to the bridge's dedicated network or share its client token.
+Shutdown retains the network for restarts. After permanently removing the
+bridge container, its network can be removed with the same runtime's
+`network rm squid-digest-bridge-network` command.
+
+Client and upstream header blocks are limited to 32 KiB. Oversized client
+headers receive `431 Request Header Fields Too Large`; oversized upstream
+responses fail with `502 Bad Gateway`. At most 100 clients are handled at once,
+including pending headers and established tunnels; excess clients are closed
+immediately. Pending headers and connection setup have 10-second timeouts.
+
+Upstream Digest authentication supports MD5 with `qop=auth`, including the
+standard default of MD5 when `algorithm` is omitted. Unsupported algorithms,
+missing/unsupported `qop`, malformed challenges, and duplicate parameters fail
+with `502`; the bridge does not retry with legacy Digest or another
+authentication scheme. Digest values are escaped and control characters are
+rejected. The Squid connection still uses plain TCP: Digest keeps the plaintext
+password off the wire, but does not encrypt the exchange or prevent offline
+password guessing by an observer on that connection.
+
 `startup.sh` reads `UPSTREAM_SQUID_HOST`, `UPSTREAM_SQUID_PORT`, and
 `CONTAINER_RUNTIME`, and `PROXY_DOMAINS_FILE` from `.env` beside the script.
 Exported variables override `.env` values. Both upstream settings are required
@@ -186,7 +229,7 @@ not Docker Swarm secrets, and have no application-level encryption.
 
 When Squid is needed, the bridge reads credentials once at startup, before
 listening. Missing or invalid credentials cause it to exit. Direct-only mode
-does not read, create, or mount credentials. Switching to direct-only mode
+does not read, create, or mount corporate credentials. Switching to direct-only mode
 removes the previous Docker credential volume; an existing Podman secret is
 retained in runtime storage but is not mounted. The bridge consumes routing and
 upstream configuration variables at startup. Credential environment variables
@@ -220,7 +263,8 @@ For an opt-in live smoke test against a running engine, use
 `python3 tests/smoke_runtime.py podman` (or `docker` / `orbstack`). It uses an
 isolated repository copy, a unique container and spare port, dummy credentials,
 and simulated Digest and direct destinations inside the container. It verifies
-both routes, strict failure behavior, restart, replacement, credential isolation,
+both routes, client authentication from localhost and unrelated containers,
+strict failure behavior, restart, replacement, credential isolation,
 direct-only startup without upstream settings/credentials, and shutdown,
 then removes its containers and credential storage. It does not contact a
 corporate proxy or an external destination.

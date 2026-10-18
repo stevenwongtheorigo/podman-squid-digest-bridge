@@ -24,7 +24,7 @@ class RuntimeTests(unittest.TestCase):
         for name in ("startup.sh", "shutdown.sh", "runtime.sh", "bridge.py"):
             shutil.copy2(ROOT / name, self.root / name)
         # A controlled PATH makes engine detection independent of the host.
-        for name in ("dirname", "cat", "mktemp", "mv", "rm"):
+        for name in ("dirname", "cat", "mktemp", "mv", "rm", "chmod"):
             (self.bin / name).symlink_to(shutil.which(name))
         uname = self.bin / "uname"
         uname.write_text('#!/bin/bash\nprintf "%s\\n" "${TEST_OS:-Linux}"\n')
@@ -329,6 +329,54 @@ class RuntimeTests(unittest.TestCase):
         self.run_script(success=False, TEST_FAIL="run", PROXY_DOMAINS_FILE=str(self.root / "empty.txt"))
         self.assertEqual(self.model(), {"container": None, "volumes": []})
         self.assertFalse((self.root / ".bridge-runtime").exists())
+
+    def test_bridge_uses_a_dedicated_network_on_all_runtimes(self):
+        self.install("podman")
+        self.install("docker")
+        for kind in ("podman", "docker", "orbstack"):
+            with self.subTest(kind=kind):
+                start = len(self.calls())
+                self.run_script(CONTAINER_RUNTIME=kind)
+                args = self.model()["container"]["args"]
+                self.assertEqual(args[args.index("--network") + 1], "squid-digest-bridge-network")
+                self.assertEqual(json.loads((self.root / "networks.json").read_text()),
+                                 {"squid-digest-bridge-network": "true"})
+                self.run_script("shutdown.sh")
+
+    def test_unmanaged_network_is_refused_before_creating_credentials(self):
+        self.install("docker")
+        (self.root / "networks.json").write_text(json.dumps({"squid-digest-bridge-network": ""}))
+        result = self.run_script(success=False, PROXY_DIGEST_USER="", PROXY_DIGEST_PASS="")
+        self.assertIn("refusing to use", result.stderr)
+        self.assertFalse(any("secret" in args or "--interactive" in args for _, args in self.calls()))
+
+    def test_network_creation_failure_keeps_the_existing_container(self):
+        self.install("docker")
+        self.run_script()
+        before = self.model()
+        (self.root / "networks.json").unlink()
+        self.run_script(success=False, TEST_FAIL="network", PROXY_DIGEST_USER="", PROXY_DIGEST_PASS="")
+        self.assertEqual(self.model(), before)
+
+    def test_client_token_is_private_persistent_and_not_in_cli_arguments(self):
+        self.install("docker")
+        self.run_script()
+        path = self.root / ".bridge-client-token"
+        token = path.read_text().strip()
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertNotIn(token, (self.root / "calls").read_text())
+        self.assertIn(str(path) + ":/run/secrets/bridge_client_token:ro", self.model()["container"]["args"])
+        self.run_script()
+        self.assertEqual(path.read_text().strip(), token)
+
+    def test_invalid_client_token_fails_before_replacing_the_container(self):
+        self.install("docker")
+        self.run_script()
+        before = self.model()
+        (self.root / ".bridge-client-token").write_text("invalid")
+        result = self.run_script(success=False)
+        self.assertIn("Invalid local client token", result.stderr)
+        self.assertEqual(self.model(), before)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import binascii
 import hashlib
+import hmac
 import ipaddress
 import logging
 import os
@@ -11,7 +14,14 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CONNECT_TIMEOUT = 10
+MAX_HEADER_BYTES = 32 * 1024
+MAX_CLIENTS = 100
+active_clients = 0
 DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+DIGEST_PARAM = re.compile(
+    r'''[ \t]*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)[ \t]*=[ \t]*'''
+    r'''(?:"((?:[^"\\\x00-\x1f\x7f]|\\[\x20-\x7e])*)"|([!#$%&'*+\-.^_`|~0-9A-Za-z]+))[ \t]*(?:,|$)'''
+)
 
 
 def normalize_hostname(host):
@@ -85,6 +95,21 @@ def parse_connect_target(target):
     return host, port
 
 
+def load_client_token():
+    try:
+        token = Path("/run/secrets/bridge_client_token").read_bytes().strip()
+    except OSError:
+        raise SystemExit("Unable to read local client token; start with ./startup.sh") from None
+    if re.fullmatch(rb"[A-Za-z0-9_-]{32,128}", token) is None:
+        raise SystemExit("Invalid local client token; start with ./startup.sh")
+    return token
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--check-client-token"]:
+    load_client_token()
+    raise SystemExit(0)
+
+
 # Consume routing and upstream settings once, before starting the server.
 DOMAIN_RULES = load_domain_rules(os.environ.pop("PROXY_DOMAINS_FILE", ""))
 NEEDS_UPSTREAM = DOMAIN_RULES is None or bool(DOMAIN_RULES)
@@ -108,6 +133,7 @@ if __name__ == "__main__" and sys.argv[1:] == ["--check-config"]:
     raise SystemExit(0)
 
 USERNAME = PASSWORD = None
+CLIENT_TOKEN = load_client_token()
 if NEEDS_UPSTREAM:
     try:
         USERNAME, PASSWORD = (
@@ -131,16 +157,37 @@ def md5(data: str) -> str:
     return hashlib.md5(data.encode("utf-8")).hexdigest()
 
 def parse_auth_challenge(header_val: str):
-    matches = re.findall(r'(\w+)=(?:"([^"]+)"|([^\s,]+))', header_val)
-    params = {k.lower(): v or v2 for k, v, v2 in matches}
-    state["realm"] = params.get("realm")
-    state["nonce"] = params.get("nonce")
-    state["qop"] = params.get("qop")
-    state["opaque"] = params.get("opaque")
-    state["nc"] = 0
+    state.update(realm=None, nonce=None, qop=None, opaque=None, nc=0)
+    scheme, separator, fields = header_val.partition(" ")
+    if not separator or scheme.lower() != "digest":
+        raise ValueError("Unsupported authentication scheme")
+    params = {}
+    position = 0
+    while position < len(fields):
+        match = DIGEST_PARAM.match(fields, position)
+        if match is None:
+            raise ValueError("Invalid Digest challenge")
+        name = match[1].lower()
+        if name in params:
+            raise ValueError("Duplicate Digest parameter")
+        params[name] = re.sub(r"\\(.)", r"\1", match[2]) if match[2] is not None else match[3]
+        position = match.end()
+    if params.get("algorithm", "MD5").upper() != "MD5":
+        raise ValueError("Unsupported Digest algorithm; only MD5 is supported")
+    if "auth" not in {value.strip().lower() for value in params.get("qop", "").split(",")}:
+        raise ValueError("Digest challenge must offer qop=auth")
+    if params.get("realm") is None or not params.get("nonce"):
+        raise ValueError("Invalid Digest challenge")
+    state.update(realm=params["realm"], nonce=params["nonce"], qop="auth", opaque=params.get("opaque"))
+
+
+def quote_auth_value(value):
+    if re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("Invalid Digest field")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 def build_auth_header(method: str, uri: str) -> str:
-    if not (state["realm"] and state["nonce"]):
+    if state["realm"] is None or state["nonce"] is None:
         return ""
     state["nc"] += 1
     nc_str = f"{state['nc']:08x}"
@@ -149,30 +196,30 @@ def build_auth_header(method: str, uri: str) -> str:
     ha1 = md5(f"{USERNAME}:{state['realm']}:{PASSWORD}")
     ha2 = md5(f"{method}:{uri}")
 
-    if state["qop"] and "auth" in state["qop"].split(","):
-        resp = md5(f"{ha1}:{state['nonce']}:{nc_str}:{cnonce}:auth:{ha2}")
-        hdr = (
-            f'Digest username="{USERNAME}", realm="{state["realm"]}", '
-            f'nonce="{state["nonce"]}", uri="{uri}", qop=auth, '
-            f'nc={nc_str}, cnonce="{cnonce}", response="{resp}"'
-        )
-    else:
-        resp = md5(f"{ha1}:{state['nonce']}:{ha2}")
-        hdr = (
-            f'Digest username="{USERNAME}", realm="{state["realm"]}", '
-            f'nonce="{state["nonce"]}", uri="{uri}", response="{resp}"'
-        )
-    if state["opaque"]:
-        hdr += f', opaque="{state["opaque"]}"'
+    resp = md5(f"{ha1}:{state['nonce']}:{nc_str}:{cnonce}:auth:{ha2}")
+    hdr = (
+        f'Digest username={quote_auth_value(USERNAME)}, realm={quote_auth_value(state["realm"])}, '
+        f'nonce={quote_auth_value(state["nonce"])}, uri={quote_auth_value(uri)}, '
+        f'algorithm=MD5, qop=auth, nc={nc_str}, cnonce="{cnonce}", response="{resp}"'
+    )
+    if state["opaque"] is not None:
+        hdr += f', opaque={quote_auth_value(state["opaque"])}'
     return hdr
 
+
+class HeaderTooLarge(ValueError):
+    pass
+
+
 async def read_headers(reader: asyncio.StreamReader):
-    raw = b""
-    while not raw.endswith(b"\r\n\r\n"):
-        line = await reader.readline()
-        if not line:
-            break
-        raw += line
+    try:
+        raw = await reader.readuntil(b"\r\n\r\n")
+    except asyncio.LimitOverrunError:
+        raise HeaderTooLarge("Headers exceed size limit") from None
+    except asyncio.IncompleteReadError as error:
+        raw = error.partial
+    if len(raw) > MAX_HEADER_BYTES:
+        raise HeaderTooLarge("Headers exceed size limit")
     return raw
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -199,7 +246,7 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 async def connect_upstream(target):
     writer = None
     try:
-        reader, writer = await asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT)
+        reader, writer = await asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT, limit=MAX_HEADER_BYTES)
         for attempt in range(2):
             auth = build_auth_header("CONNECT", target)
             request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
@@ -224,11 +271,9 @@ async def connect_upstream(target):
             if challenge is None:
                 return reader, writer, response, False
             parse_auth_challenge(challenge)
-            if not state["realm"] or not state["nonce"]:
-                raise ValueError("Invalid Digest challenge")
             writer.close()
             await writer.wait_closed()
-            reader, writer = await asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT)
+            reader, writer = await asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT, limit=MAX_HEADER_BYTES)
     except BaseException:
         if writer is not None:
             writer.close()
@@ -240,7 +285,32 @@ async def send_error(writer, status):
     await writer.drain()
 
 
+def client_authenticated(request):
+    values = []
+    for line in request.split(b"\r\n")[1:]:
+        name, separator, value = line.partition(b":")
+        if separator and name.lower() == b"proxy-authorization":
+            values.append(value.strip())
+    if len(values) != 1:
+        return False
+    scheme, separator, encoded = values[0].partition(b" ")
+    if not separator or scheme.lower() != b"basic":
+        return False
+    try:
+        supplied = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return hmac.compare_digest(supplied, b"bridge:" + CLIENT_TOKEN)
+
+
 async def handle_client(c_reader: asyncio.StreamReader, c_writer: asyncio.StreamWriter):
+    global active_clients
+    if active_clients >= MAX_CLIENTS:
+        c_writer.close()
+        return
+    # No await between admission and reservation; pending headers and established
+    # tunnels both count toward the limit. Excess clients are closed immediately.
+    active_clients += 1
     u_writer = None
     try:
         try:
@@ -250,11 +320,20 @@ async def handle_client(c_reader: asyncio.StreamReader, c_writer: asyncio.Stream
             parts = request.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
             if len(parts) != 3 or parts[2] not in ("HTTP/1.0", "HTTP/1.1") or not request.endswith(b"\r\n\r\n"):
                 raise ValueError("Invalid request")
+            if not client_authenticated(request):
+                c_writer.write(b'HTTP/1.1 407 Proxy Authentication Required\r\n'
+                               b'Proxy-Authenticate: Basic realm="Squid Digest Bridge"\r\n'
+                               b'Content-Length: 0\r\nConnection: close\r\n\r\n')
+                await c_writer.drain()
+                return
             method, target, _ = parts
             if method.upper() != "CONNECT":
                 await send_error(c_writer, "501 Not Implemented")
                 return
             host, port = parse_connect_target(target)
+        except HeaderTooLarge:
+            await send_error(c_writer, "431 Request Header Fields Too Large")
+            return
         except (ValueError, asyncio.TimeoutError):
             await send_error(c_writer, "400 Bad Request")
             return
@@ -283,13 +362,14 @@ async def handle_client(c_reader: asyncio.StreamReader, c_writer: asyncio.Stream
         # The client may disconnect while its request is being handled.
         pass
     finally:
+        active_clients -= 1
         if u_writer is not None:
             u_writer.close()
         c_writer.close()
 
 
 async def main():
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 8080)
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 8080, limit=MAX_HEADER_BYTES)
     mode = "all via Squid" if DOMAIN_RULES is None else f"{len(DOMAIN_RULES)} proxy domain rules"
     logging.info("Digest Bridge listening on :8080 (%s)", mode)
     async with server:

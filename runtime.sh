@@ -2,6 +2,8 @@
 # Shared by startup.sh and shutdown.sh; configuration/state is parsed, never sourced.
 
 container_name=squid-digest-bridge
+network_name=$container_name-network
+client_token_file=.bridge-client-token
 image=docker.io/library/python:3.12-alpine
 managed_label=io.squid-digest-bridge.managed
 credentials_label=io.squid-digest-bridge.credentials

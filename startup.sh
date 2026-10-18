@@ -51,6 +51,39 @@ if [ -n "${PROXY_DOMAINS_FILE:-}" ]; then
     esac
 fi
 
+if ! runtime network inspect "$network_name" >/dev/null 2>&1; then
+    runtime network create --driver bridge --label "$managed_label=true" "$network_name" >/dev/null
+fi
+network_owner=$(runtime network inspect --format "{{index .Labels \"$managed_label\"}}" "$network_name")
+if [ "$network_owner" != true ]; then
+    printf 'Error: Network %s is not managed by this project; refusing to use it.\n' "$network_name" >&2
+    exit 1
+fi
+
+if [ -L "$client_token_file" ]; then
+    printf 'Error: Local client token must not be a symbolic link.\n' >&2
+    exit 1
+fi
+if [ ! -e "$client_token_file" ]; then
+    token_temp=$(mktemp "$client_token_file.XXXXXX")
+    if ! runtime run --rm --network none "$image" python -c 'import secrets; print(secrets.token_urlsafe(32))' > "$token_temp"; then
+        rm -f -- "$token_temp"
+        exit 1
+    fi
+    chmod 600 "$token_temp"
+    mv -f -- "$token_temp" "$client_token_file"
+fi
+if [ ! -f "$client_token_file" ] || [ ! -r "$client_token_file" ]; then
+    printf 'Error: Local client token must be a readable regular file.\n' >&2
+    exit 1
+fi
+chmod 600 "$client_token_file"
+token_options=ro
+[ "$runtime_kind" != podman ] || token_options=ro,Z
+client_args=(--volume "$PWD/$client_token_file:/run/secrets/bridge_client_token:$token_options")
+runtime run --rm --network none "${config_args[@]}" "${client_args[@]}" \
+    "$image" python /app/bridge.py --check-client-token
+
 if [ "$needs_upstream" = proxy ]; then
     : "${UPSTREAM_SQUID_HOST:?Set UPSTREAM_SQUID_HOST in .env or export it}"
     : "${UPSTREAM_SQUID_PORT:?Set UPSTREAM_SQUID_PORT in .env or export it}"
@@ -102,8 +135,9 @@ state_temp=$(mktemp "$state_file.XXXXXX")
 printf '%s\n' "$selected_state" > "$state_temp"
 
 run_args=(--detach --name "$container_name" --restart unless-stopped
+    --network "$network_name"
     --publish 127.0.0.1:8080:8080
-    --label "$managed_label=true" "${config_args[@]}")
+    --label "$managed_label=true" "${config_args[@]}" "${client_args[@]}")
 if [ "$needs_upstream" = proxy ]; then
     run_args+=(--env "UPSTREAM_SQUID_HOST=$UPSTREAM_SQUID_HOST"
         --env "UPSTREAM_SQUID_PORT=$UPSTREAM_SQUID_PORT")
