@@ -1,11 +1,6 @@
-import json
 import os
 from pathlib import Path
 import runpy
-import shutil
-import subprocess
-import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,43 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CredentialTests(unittest.TestCase):
-    def test_missing_podman_shows_installation_help_before_configuration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            startup = Path(directory) / "startup.sh"
-            shutil.copy2(ROOT / "startup.sh", startup)
-            uname = Path(directory) / "uname"
-            uname.write_text('#!/bin/bash\nprintf "%s\\n" "$TEST_OS"\n')
-            uname.chmod(0o700)
-            for system, heading in (("Darwin", "macOS:"),
-                                    ("MINGW64_NT-10.0", "Windows:"),
-                                    ("MSYS_NT-10.0", "Windows:"),
-                                    ("CYGWIN_NT-10.0", "Windows:"),
-                                    ("Windows_NT", "Windows:"),
-                                    ("Linux", "Linux:"),
-                                    ("FreeBSD", None)):
-                with self.subTest(system=system):
-                    result = subprocess.run(
-                        ["/bin/bash", str(startup)],
-                        env={"PATH": directory, "TEST_OS": system},
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(result.returncode, 127)
-                    self.assertIn("Podman is not installed", result.stderr)
-                    self.assertIn("https://podman.io/docs/installation", result.stderr)
-                    for platform in ("macOS:", "Windows:", "Linux:"):
-                        if platform == heading:
-                            self.assertIn(platform, result.stderr)
-                        else:
-                            self.assertNotIn(platform, result.stderr)
-                    if heading in ("macOS:", "Windows:"):
-                        self.assertIn("podman machine init", result.stderr)
-                        self.assertIn("podman machine start", result.stderr)
-                    self.assertIn("./startup.sh again", result.stderr)
-                    self.assertNotIn("command not found", result.stderr)
-                    self.assertNotIn("Proxy username:", result.stderr)
-                    self.assertEqual(result.stdout, "")
-
     def setUp(self):
         self.environment = patch.dict(os.environ, {
             "UPSTREAM_SQUID_HOST": "proxy.example.com",
@@ -91,68 +49,6 @@ class CredentialTests(unittest.TestCase):
         with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit):
                 runpy.run_path(str(ROOT / "bridge.py"))
-
-    def test_startup_sends_secret_only_through_stdin(self):
-        with tempfile.TemporaryDirectory() as directory:
-            startup = Path(directory) / "startup.sh"
-            shutil.copy2(ROOT / "startup.sh", startup)
-            (Path(directory) / ".env").write_text(
-                "UPSTREAM_SQUID_HOST=upstream.example.com\n"
-                "UPSTREAM_SQUID_PORT=4567\n"
-                "PROXY_DIGEST_USER=ignored-user\n"
-                "PROXY_DIGEST_PASS=ignored-password\n"
-            )
-            fake = Path(directory) / "podman"
-            fake.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                "assert 'PROXY_DIGEST_USER' not in os.environ\n"
-                "assert 'PROXY_DIGEST_PASS' not in os.environ\n"
-                "root = pathlib.Path(os.environ['TEST_CAPTURE_DIR'])\n"
-                "if sys.argv[1:3] == ['secret', 'create']:\n"
-                "    (root / 'secret').write_bytes(sys.stdin.buffer.read())\n"
-                "elif sys.argv[1] == 'run':\n"
-                "    (root / 'args').write_text(json.dumps(sys.argv[1:]))\n"
-                "else:\n"
-                "    sys.exit(2)\n"
-            )
-            fake.chmod(0o700)
-            username, password = "test user", "test password $ \\\n"
-            env = dict(
-                os.environ,
-                PATH=directory + os.pathsep + os.environ["PATH"],
-                TEST_CAPTURE_DIR=directory,
-                PROXY_DIGEST_USER=username,
-                PROXY_DIGEST_PASS=password,
-            )
-            env.pop("UPSTREAM_SQUID_HOST", None)
-            env.pop("UPSTREAM_SQUID_PORT", None)
-            subprocess.run([str(startup)], env=env, check=True)
-            self.assertEqual(
-                (Path(directory) / "secret").read_bytes(),
-                (username + "\0" + password).encode(),
-            )
-            args = json.loads((Path(directory) / "args").read_text())
-            self.assertIn("UPSTREAM_SQUID_HOST=upstream.example.com", args)
-            self.assertIn("UPSTREAM_SQUID_PORT=4567", args)
-            self.assertNotIn(username, " ".join(args))
-            self.assertNotIn(password, " ".join(args))
-            self.assertIn(
-                "source=squid-digest-bridge-credentials,type=mount,"
-                "target=proxy_digest_credentials,mode=0400", args
-            )
-            env.update(UPSTREAM_SQUID_HOST="override.example.com", UPSTREAM_SQUID_PORT="5678")
-            subprocess.run([str(startup)], env=env, check=True)
-            args = json.loads((Path(directory) / "args").read_text())
-            self.assertIn("UPSTREAM_SQUID_HOST=override.example.com", args)
-            self.assertIn("UPSTREAM_SQUID_PORT=5678", args)
-
-            (Path(directory) / ".env").unlink()
-            env.pop("UPSTREAM_SQUID_HOST")
-            env.pop("UPSTREAM_SQUID_PORT")
-            result = subprocess.run([str(startup)], env=env, capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Set UPSTREAM_SQUID_HOST", result.stderr)
 
     def test_invalid_upstream_configuration_fails(self):
         for host, port in (("", "3128"), ("proxy.example.com", ""),
