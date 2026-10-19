@@ -221,6 +221,11 @@ For Podman, credentials pass through stdin to the native secret named
 `/run/secrets/proxy_digest_credentials` with mode `0400`. Podman's default secret
 driver stores a protected file; it is not encrypted by default.
 
+Startup checks whether the credential secret already exists and uses
+`secret create --replace` only when updating it. This avoids Podman 4.9.3's
+first-creation failure (`deleting secret : : no secret data with ID`). Secret
+lookup/storage failures stop startup; they are not treated as an absent secret.
+
 For Docker and OrbStack, a temporary container receives credentials through
 stdin and writes a mode-`0400` file into a fresh named volume. It uses the same
 Python image as the bridge, with networking disabled, and is removed afterward.

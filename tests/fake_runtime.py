@@ -64,8 +64,16 @@ elif args[:2] == ["image", "inspect"]:
         sys.exit(1)
 elif args[0] == "pull":
     fail("pull")
+elif args[:2] == ["secret", "exists"]:
+    assert engine == "podman"
+    if os.environ.get("TEST_FAIL") == "secret-exists":
+        sys.exit(125)
+    sys.exit(0 if (root / "secret").exists() else 1)
 elif args[:2] == ["secret", "create"]:
     assert engine == "podman"
+    if os.environ.get("TEST_PODMAN_493") and "--replace" in args and not (root / "secret").exists():
+        print("Error: deleting secret : : no secret data with ID", file=sys.stderr)
+        sys.exit(125)
     (root / "secret").write_bytes(sys.stdin.buffer.read())
 elif args[:2] == ["container", "ls"]:
     fail("list")

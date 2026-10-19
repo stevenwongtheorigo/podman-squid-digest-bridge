@@ -397,6 +397,35 @@ class RuntimeTests(unittest.TestCase):
                     self.assertFalse(target.startswith(parent + "/"),
                                      f"Mount {target} requires creating a mountpoint inside read-only {parent}")
 
+    def test_podman_493_first_start_creates_secret_without_replace(self):
+        self.install("podman")
+        self.run_script(TEST_PODMAN_493="1")
+        creates = [args for _, args in self.calls() if "create" in args and "secret" in args]
+        self.assertEqual(len(creates), 1)
+        self.assertNotIn("--replace", creates[0])
+        self.assertEqual((self.root / "secret").read_bytes(), (USERNAME + "\0" + PASSWORD).encode())
+
+    def test_podman_493_repeated_start_replaces_existing_secret(self):
+        self.install("podman")
+        (self.root / "secret").write_bytes(b"old-user\0old-password")
+        self.run_script(TEST_PODMAN_493="1")
+        creates = [args for _, args in self.calls() if "create" in args and "secret" in args]
+        self.assertIn("--replace", creates[0])
+        self.assertEqual((self.root / "secret").read_bytes(), (USERNAME + "\0" + PASSWORD).encode())
+
+    def test_podman_secret_lookup_error_does_not_modify_secret_or_container(self):
+        self.install("podman")
+        self.run_script()
+        before = self.model()
+        secret = (self.root / "secret").read_bytes()
+        start = len(self.calls())
+        result = self.run_script(success=False, TEST_FAIL="secret-exists")
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("Unable to check the existing Podman credential secret", result.stderr)
+        self.assertEqual(self.model(), before)
+        self.assertEqual((self.root / "secret").read_bytes(), secret)
+        self.assertFalse(any("secret" in args and "create" in args for _, args in self.calls()[start:]))
+
 
 if __name__ == "__main__":
     unittest.main()

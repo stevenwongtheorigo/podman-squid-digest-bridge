@@ -146,8 +146,20 @@ if [ "$needs_upstream" = proxy ]; then
 fi
 if [ "$runtime_kind" = podman ]; then
     if [ "$needs_upstream" = proxy ]; then
+        secret_create_args=(secret create)
+        if runtime secret exists squid-digest-bridge-credentials; then
+            secret_create_args+=(--replace)
+        else
+            secret_status=$?
+            if [ "$secret_status" -ne 1 ]; then
+                printf 'Error: Unable to check the existing Podman credential secret.\n' >&2
+                exit "$secret_status"
+            fi
+        fi
+        # Podman 4.9.3 attempts to delete an empty secret ID when --replace is
+        # used for a name that does not exist yet. Only replace existing data.
         printf '%s\0%s' "$proxy_username" "$proxy_password" |
-            runtime secret create --replace squid-digest-bridge-credentials - >/dev/null
+            runtime "${secret_create_args[@]}" squid-digest-bridge-credentials - >/dev/null
         unset proxy_username proxy_password
         run_args+=(--secret source=squid-digest-bridge-credentials,type=mount,target=proxy_digest_credentials,mode=0400)
     fi
